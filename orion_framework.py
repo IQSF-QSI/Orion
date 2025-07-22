@@ -1,0 +1,193 @@
+import os
+import json
+import time
+import argparse
+import openai
+from dotenv import load_dotenv
+from supabase import create_client, Client
+from openai import OpenAI
+from abc import ABC, abstractmethod
+
+# ==============================================================================
+# --- 1. CORE FRAMEWORK: THE ABSTRACT AGENT ---
+# ==============================================================================
+
+class Agent(ABC):
+    """
+    An abstract base class for all agents in the IQSF factory.
+    It defines the common structure and initialization.
+    """
+    def __init__(self):
+        print(f"\n--- Initializing {self.__class__.__name__} ---")
+        self.supabase, self.openai = self._setup_connections()
+
+    def _setup_connections(self):
+        """Loads environment variables and connects to services."""
+        load_dotenv()
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_SERVICE_KEY")
+        openai_api_key = os.environ.get("OPENAI_API_KEY")
+        if not all([url, key, openai_api_key]):
+            raise EnvironmentError("Supabase or OpenAI credentials not found.")
+        
+        supabase_client = create_client(url, key)
+        openai_client = OpenAI(api_key=openai_api_key)
+        print("-> Connections established.")
+        return supabase_client, openai_client
+
+    @abstractmethod
+    def run(self, **kwargs):
+        """
+        The main execution method for the agent. This must be implemented by all subclasses.
+        """
+        pass
+
+# ==============================================================================
+# --- 2. CONCRETE AGENTS: THE WORKERS ---
+# ==============================================================================
+
+class PlannerAgent(Agent):
+    """
+    Agent responsible for creating a new research plan for a country.
+    """
+    METHODOLOGY = {
+        "Legal Protections": ["Constitutional protections...", "Anti-discrimination laws..."],
+        "Social Attitudes": ["Public opinion polling...", "Religious and cultural attitudes..."],
+        # ... (full methodology here)
+    }
+
+    def _generate_questions(self, country_name: str, dimension: str, sub_points: list) -> list:
+        print(f"  -> Generating questions for dimension: '{dimension}'...")
+        prompt = f"""
+        You are an IQSF Index Analyst. Generate Key Research Questions (KRQs) for **{country_name}** for the **'{dimension}'** dimension.
+        Based on these sub-points: {json.dumps(sub_points)}.
+        Your analysis MUST be intersectional. Return a JSON object: {{"key_research_questions": ["..."]}}
+        """
+        try:
+            response = self.openai.chat.completions.create(
+                model="gpt-4-turbo-preview",
+                messages=[{"role": "system", "content": "You are a research strategist..."}, {"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+            return json.loads(response.choices[0].message.content).get("key_research_questions", [])
+        except Exception as e:
+            print(f"    -> Error generating questions: {e}")
+            return []
+
+    def run(self, country: str, pillar_id: int = 3):
+        print(f"-> Starting research plan for {country}.")
+        response = self.supabase.rpc('create_new_report', {'country_name_input': country, 'pillar_id_input': pillar_id}).execute()
+        report_id = response.data
+        if not report_id:
+            print("-> ERROR: Failed to create report entry. Aborting.")
+            return
+
+        print(f"-> Report entry created with ID: {report_id}")
+        all_questions = []
+        for dimension, sub_points in self.METHODOLOGY.items():
+            questions = self._generate_questions(country, dimension, sub_points)
+            all_questions.extend(questions)
+        
+        if all_questions:
+            self.supabase.table('research_questions').insert([{"report_id": report_id, "question": q} for q in all_questions]).execute()
+            print(f"-> SUCCESS: Saved {len(all_questions)} questions for Report ID {report_id}.")
+        else:
+            self.supabase.table('reports').update({"status": "PLAN_FAILED"}).eq("id", report_id).execute()
+            print("-> ERROR: Failed to generate any questions.")
+
+class GathererAgent(Agent):
+    """
+    Agent responsible for finding evidence for pending research questions.
+    Designed to run continuously.
+    """
+    def _find_evidence(self, question_text: str) -> dict:
+        print(f"  -> Researching: '{question_text}'")
+        prompt = f"You are an AI Research Agent... Research Question: \"{question_text}\"..." # (full prompt)
+        try:
+            response = self.openai.chat.completions.create(...) # (full call)
+            return json.loads(response.choices[0].message.content)
+        except Exception as e:
+            print(f"    -> OpenAI Error: {e}")
+            return None
+
+    def run(self):
+        print("-> Starting continuous evidence gathering. Press Ctrl+C to stop.")
+        while True:
+            response = self.supabase.rpc('get_next_unanswered_question').execute()
+            question = response.data[0] if response.data else None
+            
+            if not question:
+                print("-> No pending questions found. Waiting for 10 seconds.")
+                time.sleep(10)
+                continue
+            
+            question_id = question['id']
+            evidence = self._find_evidence(question['question'])
+            
+            if evidence:
+                evidence.pop('question', None)
+                evidence['question_id'] = question_id
+                self.supabase.table('evidence_items').insert(evidence).execute()
+                self.supabase.table('research_questions').update({'status': 'COMPLETE'}).eq('id', question_id).execute()
+                print(f"  -> SUCCESS: Processed question {question_id}.")
+            else:
+                self.supabase.table('research_questions').update({'status': 'RESEARCH_FAILED'}).eq('id', question_id).execute()
+                print(f"  -> FAILED: Could not find evidence for question {question_id}.")
+
+# ==============================================================================
+# --- (Define ScoringAgent and NarrativeAgent classes similarly) ---
+# You would create these classes following the same pattern.
+# ==============================================================================
+class ScoringAgent(Agent):
+    def run(self):
+        print("-> Scoring agent logic goes here...")
+        # ... Paste logic from ScoringAgent.py ...
+
+class NarrativeAgent(Agent):
+    def run(self):
+        print("-> Narrative agent logic goes here...")
+        # ... Paste logic from NarrativeGenerator.py ...
+
+# ==============================================================================
+# --- 3. MAIN COMMAND-LINE INTERFACE ---
+# ==============================================================================
+def main():
+    """
+    Parses command-line arguments and runs the appropriate agent.
+    """
+    parser = argparse.ArgumentParser(description="IQSF Agent Framework Controller.")
+    subparsers = parser.add_subparsers(dest='agent', required=True, help='The agent to run.')
+
+    # Planner Agent arguments
+    plan_parser = subparsers.add_parser('plan', help='Run the Planner Agent.')
+    plan_parser.add_argument('-c', '--country', type=str, required=True, help='The country to research.')
+
+    # Gatherer Agent arguments
+    gather_parser = subparsers.add_parser('gather', help='Run the Gatherer Agent continuously.')
+
+    # Scorer Agent arguments
+    score_parser = subparsers.add_parser('score', help='Run the Scoring Agent.')
+
+    # Narrative Agent arguments
+    narrate_parser = subparsers.add_parser('narrate', help='Run the Narrative Agent.')
+
+    args = parser.parse_args()
+
+    # --- Agent Factory ---
+    if args.agent == 'plan':
+        agent = PlannerAgent()
+        agent.run(country=args.country)
+    elif args.agent == 'gather':
+        agent = GathererAgent()
+        agent.run()
+    elif args.agent == 'score':
+        agent = ScoringAgent()
+        agent.run()
+    elif args.agent == 'narrate':
+        agent = NarrativeAgent()
+        agent.run()
+    else:
+        print(f"Error: Unknown agent '{args.agent}'")
+
+if __name__ == "__main__":
+    main()
