@@ -3,7 +3,7 @@ import json
 import time
 import argparse
 import openai
-from dotenv import load_dotenv
+# from dotenv import load_dotenv # No longer needed when using Doppler
 from supabase import create_client, Client
 from openai import OpenAI
 from abc import ABC, abstractmethod
@@ -58,12 +58,12 @@ class Agent(ABC):
         self.supabase, self.openai = self._setup_connections()
 
     def _setup_connections(self):
-        load_dotenv()
+        """Loads environment variables directly from the environment (injected by Doppler)."""
         url = os.environ.get("SUPABASE_URL")
         key = os.environ.get("SUPABASE_SERVICE_KEY")
         openai_api_key = os.environ.get("OPENAI_API_KEY")
         if not all([url, key, openai_api_key]):
-            raise EnvironmentError("Supabase or OpenAI credentials not found.")
+            raise EnvironmentError("Supabase or OpenAI credentials not found. Ensure Doppler is running.")
         
         supabase_client = create_client(url, key)
         openai_client = OpenAI(api_key=openai_api_key)
@@ -261,15 +261,77 @@ class NarrativeAgent(Agent):
 
 class CurriculumDeveloperAgent(Agent):
     """Transforms finished reports into educational course content."""
+    def _generate_course_blueprint(self, report_narrative: str, country_name: str) -> dict:
+        print(f"  -> Generating course blueprint for {country_name}...")
+        prompt = f"""
+        You are an expert Instructional Designer. Transform the following intelligence report on **{country_name}** into a blueprint for a Skool mini-course.
+        Generate a JSON object with: Course Title, Learning Objectives, Module Breakdown (with titles and descriptions), and a Downloadable Asset Idea.
+        **Source Intelligence Report:** --- {report_narrative} ---
+        """
+        try:
+            response = self.openai.chat.completions.create(model="gpt-4-turbo-preview", messages=[{"role": "system", "content": "You are an Instructional Designer..."}, {"role": "user", "content": prompt}], response_format={"type": "json_object"})
+            return json.loads(response.choices[0].message.content)
+        except Exception as e:
+            print(f"  -> Error generating course blueprint: {e}")
+            return None
+
     def run(self, report_id: int):
         print(f"-> Starting curriculum development for Report ID: {report_id}")
-        # ... (Implementation from previous message) ...
+        response = self.supabase.table('published_content').select('final_article_text, reports(country_name)').eq('report_id', report_id).single().execute()
+        if not response.data:
+            print(f"-> ERROR: No published content found for Report ID {report_id}.")
+            return
+
+        narrative = response.data['final_article_text']
+        country_name = response.data['reports']['country_name']
+        course_plan = self._generate_course_blueprint(narrative, country_name)
+        
+        if course_plan:
+            print("\n--- COURSE BLUEPRINT GENERATED ---")
+            print(json.dumps(course_plan, indent=2))
+        else:
+            print("-> FAILED: Could not generate course blueprint.")
 
 class AcademicReportAgent(Agent):
     """Transforms a standard narrative report into a formal, academic-style paper."""
+    def _generate_academic_paper(self, country_name: str, narrative_report: str, score_card: dict, evidence: list) -> str:
+        print("  -> Generating academic paper (this may take 60-120 seconds)...")
+        source_urls = list(set([s['url'] for item in evidence if 'sources' in item and item['sources'] for s in item['sources'] if 'url' in s]))
+        prompt = f"""
+        You are a Ph.D.-level academic researcher. Transform the provided IQSF report on **{country_name}** into a formal academic paper.
+        Structure it with: Abstract, Introduction, Literature Review, Methodology, Findings & Analysis (by pillar), Discussion, Conclusion, and Bibliography.
+        **Source Narrative:** --- {narrative_report} ---
+        **Source Score Card:** --- {json.dumps(score_card, indent=2)} ---
+        **Bibliography URLs:** --- {json.dumps(source_urls, indent=2)} ---
+        """
+        try:
+            response = self.openai.chat.completions.create(model="gpt-4-turbo", messages=[{"role": "system", "content": "You are a Ph.D.-level academic writer..."}, {"role": "user", "content": prompt}])
+            return response.choices[0].message.content
+        except Exception as e:
+            print(f"    -> Error generating academic paper: {e}")
+            return None
+
     def run(self, report_id: int):
         print(f"-> Starting academic paper generation for Report ID: {report_id}")
-        # ... (Implementation from previous message) ...
+        narrative_response = self.supabase.table('published_content').select('final_article_text, reports(country_name)').eq('report_id', report_id).single().execute()
+        score_card_response = self.supabase.table('index_scores').select('*').eq('report_id', report_id).single().execute()
+        evidence_response = self.supabase.rpc('get_all_evidence_for_report', {'report_id_input': report_id}).execute()
+
+        if not (narrative_response.data and score_card_response.data and evidence_response.data):
+            print(f"-> ERROR: Could not retrieve all necessary data for Report ID {report_id}.")
+            return
+
+        narrative, country_name = narrative_response.data['final_article_text'], narrative_response.data['reports']['country_name']
+        score_card, evidence = score_card_response.data, evidence_response.data
+        academic_paper = self._generate_academic_paper(country_name, narrative, score_card, evidence)
+        
+        if academic_paper:
+            filename = f"IQSF_Academic_Paper_Report_{report_id}_{country_name}.md"
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(academic_paper)
+            print(f"\n-> SUCCESS! Academic paper saved to: {filename}")
+        else:
+            print("-> FAILED: Could not generate academic paper.")
 
 # ==============================================================================
 # --- 3. MAIN COMMAND-LINE INTERFACE ---
@@ -294,20 +356,18 @@ def main():
 
     args = parser.parse_args()
 
-    # --- Agent Factory ---
+    # Agent Factory
     agent_map = {
-        'plan': (PlannerAgent, {'country': args.country if 'country' in args else None}),
+        'plan': (PlannerAgent, {'country': args.country}),
         'gather': (GathererAgent, {}),
         'score': (ScoringAgent, {}),
         'narrate': (NarrativeAgent, {}),
-        'curriculum': (CurriculumDeveloperAgent, {'report_id': args.report_id if 'report_id' in args else None}),
-        'academic': (AcademicReportAgent, {'report_id': args.report_id if 'report_id' in args else None}),
+        'curriculum': (CurriculumDeveloperAgent, {'report_id': args.report_id}),
+        'academic': (AcademicReportAgent, {'report_id': args.report_id}),
     }
 
     if args.agent in agent_map:
         AgentClass, kwargs = agent_map[args.agent]
-        # Filter out None values from kwargs
-        kwargs = {k: v for k, v in kwargs.items() if v is not None}
         agent = AgentClass()
         agent.run(**kwargs)
     else:
