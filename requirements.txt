@@ -1,0 +1,28 @@
+# Core Libraries
+openai
+supabase
+python-dotenv  # Good to keep for local development, Doppler overrides it in production
+pyjwt          # For modern Supabase authentication if needed
+argparse       # This is part of standard Python, but good to be explicit
+
+# Dependencies (pip freeze will include these automatically)
+# You don't need to type these, but this is what pip will install
+anyio
+certifi
+distro
+gotrue
+h11
+httpcore
+httpx
+idna
+jiter
+pydantic
+pyjwt
+postgrest
+realtime
+sniffio
+storage3
+supafunc
+tqdm
+typing_extensions
+websockets
